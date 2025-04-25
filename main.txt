@@ -1,0 +1,549 @@
+require("dotenv").config();
+const TelegramBot = require("node-telegram-bot-api");
+const fs = require('fs');
+const { google } = require("googleapis");
+const path = require("path");
+const { promisify } = require('util');
+const fetch = require('node-fetch');
+const pdfjsLib = require("pdfjs-dist/legacy/build/pdf.js");
+const { createCanvas } = require("canvas");
+const schedule = require('node-schedule');
+
+const token = process.env.TOKEN;
+const bot = new TelegramBot(token, { polling: true });
+
+const PDF_DIR = path.join(__dirname, 'pdfs');
+const IMAGE_DIR = path.join(__dirname, 'images');
+
+
+// ===================== SETTING PERTAMA ======================== // 
+function ensureDirectories() {
+  if (!fs.existsSync(PDF_DIR)) {
+    fs.mkdirSync(PDF_DIR, { recursive: true });
+  }
+  if (!fs.existsSync(IMAGE_DIR)) {
+    fs.mkdirSync(IMAGE_DIR, { recursive: true });
+  }
+}
+
+function isWithinOfficeHours() {
+  const now = new Date();
+  const start = new Date();
+  start.setHours(8, 0, 0, 0);
+  const end = new Date();
+  end.setHours(23, 0, 0, 0);
+  return now >= start && now <= end;
+}
+
+function createAttendanceKeyboard() {
+  return {
+    keyboard: [
+      [{ text: 'HADIR' }, { text: 'IZIN' }, { text: 'SAKIT' }]
+    ],
+    one_time_keyboard: true,
+    resize_keyboard: true,
+  };
+}
+
+function getCurrentDate() {
+  const now = new Date();
+  const day = String(now.getDate()).padStart(2, "0");
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const year = now.getFullYear();
+  return new Date(`${month}/${day}/${year}`); // Return Date object
+}
+
+async function getStudentsFromSheet() {
+  try {
+    const auth = new google.auth.GoogleAuth({
+      keyFile: "credentials.json",
+      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+    });
+    const client = await auth.getClient();
+    const sheets = google.sheets({ version: "v4", auth: client });
+
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+    const range = "SiswaMahasiswa!B:E"; 
+
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range,
+    });
+
+    const rows = response.data.values;
+    if (!rows || rows.length === 0) return [];
+
+    return rows.slice(1).map(row => ({
+      nama: row[0],
+      status: row[1],
+      asal_sekolah: row[2],
+      unit_magang: row[3],
+      kehadiran: row[4],
+    }));
+  } catch (error) {
+    console.error("❌ Error mengambil data dari Google Sheets:", error);
+    return [];
+  }
+}
+
+async function getTodayAttendance() {
+  try {
+    const auth = new google.auth.GoogleAuth({
+      keyFile: "credentials.json",
+      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+    });
+    const client = await auth.getClient();
+    const sheets = google.sheets({ version: "v4", auth: client });
+
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+    const range = "RekapKehadiran!A:G";
+    const today = getCurrentDate().toLocaleDateString("en-GB");
+
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range,
+    });
+
+    const rows = response.data.values;
+    if (!rows || rows.length === 0) return [];
+
+    return rows
+      .filter(row => row[0] === today)
+      .map(row => ({
+        nama: row[1],
+        kehadiran: row[5] // Kolom F (Kehadiran)
+      }));
+  } catch (error) {
+    console.error("❌ Error mengambil data absensi:", error);
+    return [];
+  }
+}
+
+// ====================== Sheet PDF Setting ====================== //
+
+async function downloadPDF(url, outputFilename) {
+  ensureDirectories();
+  const outputPath = path.join(PDF_DIR, outputFilename);
+
+  try {
+    console.log(`📡 Mengunduh PDF dari: ${url}`);
+
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`❌ HTTP Error: ${response.status}`);
+    }
+
+    // Simpan file sementara
+    const fileStream = fs.createWriteStream(outputPath);
+    await promisify(require('stream').pipeline)(response.body, fileStream);
+
+    // 🕒 Tambahkan delay untuk memastikan file benar-benar tersimpan
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    console.log(`✅ PDF berhasil disimpan di: ${outputPath}`);
+
+    // **Validasi apakah file PDF benar-benar ada & bisa dibaca**
+    if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size < 1024) {
+      throw new Error("❌ PDF tidak ditemukan atau ukurannya terlalu kecil!");
+    }
+
+    return outputPath;
+  } catch (error) {
+    console.error("❌ Gagal mengunduh PDF:", error);
+    return null;
+  }
+}
+
+// 🖼️ **Konversi PDF ke Gambar**
+async function convertPDFToImages(pdfPath) {
+  try {
+      if (!fs.existsSync(pdfPath)) {
+          throw new Error(`❌ File PDF tidak ditemukan: ${pdfPath}`);
+      }
+
+      console.log("🔄 Mengonversi PDF ke gambar menggunakan pdf-js...");
+      const pdfData = new Uint8Array(fs.readFileSync(pdfPath));
+      const pdfDoc = await pdfjsLib.getDocument({ data: pdfData }).promise;
+      const pageCount = pdfDoc.numPages;
+
+      const imagePaths = [];
+      for (let i = 1; i <= pageCount; i++) {
+          const page = await pdfDoc.getPage(i);
+          const viewport = page.getViewport({ scale: 2 });
+
+          const canvas = createCanvas(viewport.width, viewport.height);
+          const ctx = canvas.getContext("2d");
+
+          const renderContext = {
+              canvasContext: ctx,
+              viewport: viewport,
+          };
+
+          await page.render(renderContext).promise;
+
+          const imagePath = path.join(IMAGE_DIR, `rekap_${i}.png`);
+          const out = fs.createWriteStream(imagePath);
+          const stream = canvas.createPNGStream();
+          stream.pipe(out);
+          imagePaths.push(imagePath);
+
+          await new Promise(resolve => out.on("finish", resolve));
+      }
+
+      console.log(`✅ Berhasil mengonversi ${imagePaths.length} halaman menjadi gambar`);
+      return imagePaths;
+  } catch (error) {
+      console.error("❌ Gagal mengonversi PDF:", error);
+      return [];
+  }
+}
+
+async function getSpreadsheetPDF() {
+  try {
+    const appScriptUrl = process.env.APPSCRIPT_URL;
+    console.log(`📡 Mengambil URL PDF dari: ${appScriptUrl}`);
+
+    const response = await fetch(appScriptUrl);
+    const data = await response.json();
+
+    console.log(`📜 Response dari App Script:`, data);
+
+    if (!data.fileUrl) {
+      throw new Error("❌ Tidak ada file URL dalam response!");
+    }
+
+    return data.fileUrl;
+  } catch (error) {
+    console.error("❌ Error mengambil PDF dari App Script:", error);
+    return null;
+  }
+}
+
+async function sendAttendanceImages(chatId) {
+  ensureDirectories();
+  let pdfPath = null;
+  let imagePaths = [];
+
+  try {
+    // Ambil dan proses PDF
+    const pdfUrl = await getSpreadsheetPDF();
+    if (!pdfUrl) throw new Error("Tidak bisa mendapatkan PDF");
+    
+    pdfPath = await downloadPDF(pdfUrl, `rekap_${Date.now()}.pdf`);
+    if (!pdfPath) throw new Error("Gagal mengunduh PDF");
+    
+    imagePaths = await convertPDFToImages(pdfPath);
+    if (imagePaths.length === 0) throw new Error("Tidak ada gambar");
+
+    // Hitung statistik
+    const [students, todayAttendance] = await Promise.all([
+      getStudentsFromSheet(),
+      getTodayAttendance()
+    ]);
+
+    const totalPeserta = students.length;
+    const totalAbsen = todayAttendance.length;
+    
+    const hadirCount = todayAttendance.filter(e => e.kehadiran === 'HADIR').length;
+    const sakitCount = todayAttendance.filter(e => e.kehadiran === 'SAKIT').length;
+    const izinCount = todayAttendance.filter(e => e.kehadiran === 'IZIN').length;
+    const tanpaKeterangan = todayAttendance.filter(e => e.kehadiran === 'TANPA KABAR');
+    
+    // Format caption
+    const caption = `📢[PENGUMUMAN PRESENSI MAGANG/PKL]📢 
+
+Kepada seluruh peserta Magang/PKL, dari total ${totalPeserta} peserta, sebanyak ${totalAbsen} orang telah melakukan presensi (data terlampir) dengan rincian sebagai berikut:
+
+✅ Hadir: ${hadirCount} orang
+🤒 Sakit: ${sakitCount} Orang
+✉️ Izin: ${izinCount} Orang
+❓ Tanpa Keterangan:  ${tanpaKeterangan.length} Orang
+
+Bagi yang belum melakukan presensi, mohon segera memberikan informasi. Terima kasih atas perhatiannya.`;
+
+// ${tanpaKeterangan.map(e => `• ${e.nama}`).join('\n')}
+
+    // Kirim gambar dengan caption
+    await bot.sendPhoto(chatId, imagePaths[0], { caption });
+    
+    // Kirim gambar lainnya tanpa caption
+    for (let i = 1; i < imagePaths.length; i++) {
+      await bot.sendPhoto(chatId, imagePaths[i]);
+    }
+
+  } catch (error) {
+    await bot.sendMessage(chatId, `❌ Gagal mengirim rekap: ${error.message}`);
+  } finally {
+    // Bersihkan file
+    if (pdfPath) fs.existsSync(pdfPath) && fs.unlinkSync(pdfPath);
+    imagePaths.forEach(path => fs.existsSync(path) && fs.unlinkSync(path));
+  }
+}
+
+// ======================== Save Data Absensi ===========================
+// Modifikasi fungsi saveToGoogleSheet untuk menyertakan tanggal
+async function saveToGoogleSheet(data) {
+  try {
+    const auth = new google.auth.GoogleAuth({
+      keyFile: "credentials.json",
+      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+    });
+    const client = await auth.getClient();
+    const sheets = google.sheets({ version: "v4", auth: client });
+
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+    const range = "RekapKehadiran!A:G"; 
+    const date = getCurrentDate().toLocaleDateString('en-GB');
+    const values = [[date, data.nama, data.status, data.asal_sekolah, data.unit_magang, data.kehadiran, data.fileUrl]];
+    const resource = { values };
+
+    await sheets.spreadsheets.values.append({
+      spreadsheetId,
+      range,
+      valueInputOption: "RAW",
+      resource,
+    });
+
+    console.log("✅ Data berhasil disimpan ke Google Sheets ");
+  } catch (error) {
+    console.error("❌ Error menyimpan ke Google Sheets:", error);
+  }
+}
+
+
+// ====================== General Setting ===========================
+console.log("🚀 Bot berhasil berjalan!");
+
+const userState = {};
+
+function createNameKeyboard(names, isPrivateChat) {
+  if (!isPrivateChat) return { remove_keyboard: true };
+  
+  return {
+    keyboard: names.map(name => [{ text: name }]),
+    one_time_keyboard: true,
+    resize_keyboard: true,
+  };
+}
+
+bot.onText(/\/start/, (msg) => {
+  const chatId = msg.chat.id;
+  bot.sendMessage(chatId, "Halo! Silakan ketik /absen untuk melakukan absensi.", {
+    reply_markup: { remove_keyboard: true },
+  });
+});
+
+bot.onText(/\/absen/, async (msg) => {
+  const chatId = msg.chat.id;
+  const isPrivateChat = msg.chat.type === 'private';
+
+  // Cek apakah perintah dikirim di grup
+  if (!isPrivateChat) {
+    return bot.sendMessage(chatId, "⚠️ Fitur absensi hanya bisa digunakan di chat pribadi dengan bot ini.");
+  }
+
+  if (!isWithinOfficeHours()) {
+    bot.sendMessage(chatId, "⏰ Maaf, waktu absen telah berakhir. Absen hanya bisa dilakukan antara pukul 08:00 - 09:00.", {
+      reply_markup: { remove_keyboard: true },
+    });
+    return;
+  }
+
+  const todayAttendance = await getTodayAttendance();
+  const students = await getStudentsFromSheet();
+  const names = students.map(student => student.nama);
+  
+  const unregisteredStudents = students.filter(student => 
+    !todayAttendance.includes(student.nama)
+  );
+
+  if (unregisteredStudents.length === 0) {
+    return bot.sendMessage(chatId, "✅ Semua peserta sudah melakukan absensi hari ini");
+  }
+  
+  userState[chatId] = { 
+    step: 1, 
+    students: unregisteredStudents,
+    todayAttendance 
+  };
+
+  if (!isPrivateChat) {
+    return bot.sendMessage(chatId, "📛 Silakan lakukan absen melalui chat pribadi dengan bot ini.", {
+      reply_markup: { remove_keyboard: true }
+    });
+  }
+
+  bot.sendMessage(chatId, "📛 Pilih nama Anda dari daftar:", {
+    reply_markup: {
+      keyboard: names.map(name => [{ text: name }]),
+      one_time_keyboard: true,
+      resize_keyboard: true
+    },
+  });
+});
+
+bot.onText(/\/rekap/, async (msg) => {
+  const chatId = msg.chat.id;
+  await sendAttendanceImages(chatId);
+});
+
+bot.on("message", async (msg) => {
+  const chatId = msg.chat.id;
+  const state = userState[chatId];
+  const text = msg.text;
+
+  // Handler untuk step 1 (setelah memilih nama)
+  if (state && state.step === 1) {
+    const todayAttendance = await getTodayAttendance();
+    
+    const hasAttended = todayAttendance.some(att => att.nama === text);
+
+    if (hasAttended) {
+      delete userState[chatId];
+      return bot.sendMessage(chatId, "⛔ Kamu telah melakukan Absensi hari ini!", {
+        reply_markup: { remove_keyboard: true }
+      });
+    }
+
+    const student = state.students.find(s => s.nama === text);
+    if (!student) {
+      delete userState[chatId];
+      return bot.sendMessage(chatId, "❌ Nama tidak valid, silakan mulai lagi dengan /absen", {
+        reply_markup: { remove_keyboard: true }
+      });
+    }
+
+    // Update ke step 2 dan kirim keyboard kehadiran
+    userState[chatId] = {
+      step: 2,
+      data: student
+    };
+
+    return bot.sendMessage(chatId, "📊 Pilih status kehadiran:", {
+      reply_markup: createAttendanceKeyboard()
+    });
+  }
+
+  // Handler untuk step 2 (pemilihan status)
+  if (state && state.step === 2) {
+    if (!['HADIR', 'IZIN', 'SAKIT'].includes(text)) {
+      return bot.sendMessage(chatId, "❌ Silakan pilih status menggunakan tombol!", {
+        reply_markup: createAttendanceKeyboard()
+      });
+    }
+    
+    if (!isWithinOfficeHours()) {
+      delete userState[chatId];
+      return bot.sendMessage(chatId, "⏰ Waktu absen telah berakhir!");
+    }
+
+    // Update ke step 3 dengan data kehadiran
+    userState[chatId] = {
+      step: 3,
+      data: { 
+        ...state.data, 
+        kehadiran: text 
+      }
+    };
+    
+    return bot.sendMessage(chatId, "📷 Silakan kirim foto sebagai bukti:", {
+      reply_markup: { remove_keyboard: true }
+    });
+  }
+});
+
+// ====================== PERUBAHAN 4: Auto TANPA KABAR & Rekap ====================== //
+async function markMissingStudents() {
+  try {
+    const auth = new google.auth.GoogleAuth({
+      keyFile: "credentials.json",
+      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+    });
+    const client = await auth.getClient();
+    const sheets = google.sheets({ version: "v4", auth: client });
+
+    // Dapatkan data siswa dan absensi hari ini
+    const [students, todayAttendance] = await Promise.all([
+      getStudentsFromSheet(),
+      getTodayAttendance()
+    ]);
+
+    // Filter siswa yang belum absen
+    const missing = students.filter(student => 
+      !todayAttendance.some(att => att.nama === student.nama)
+    );
+
+    // Format tanggal hari ini
+    const today = getCurrentDate().toLocaleDateString('en-GB');
+
+    // Tambahkan data ke sheet
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: process.env.SPREADSHEET_ID,
+      range: "RekapKehadiran!A:G",
+      valueInputOption: "RAW",
+      resource: {
+        values: missing.map(student => [
+          today,
+          student.nama,
+          student.status,
+          student.asal_sekolah,
+          student.unit_magang,
+          "TANPA KABAR",
+          ""
+        ])
+      }
+    });
+    
+    console.log(`✅ Tandai ${missing.length} siswa sebagai TANPA KABAR`);
+  } catch (error) {
+    console.error("❌ Gagal menandai siswa:", error);
+  }
+}
+
+schedule.scheduleJob('40 11 * * *', async () => {
+  await markMissingStudents(); 
+  await sendAttendanceImages(-4609772485);
+  console.log("✅ Rekap harian terkirim");
+});
+
+bot.on("photo", async (msg) => {
+  const chatId = msg.chat.id;
+  if (!userState[chatId] || userState[chatId].step !== 3) return;
+
+  try {
+    const state = userState[chatId];
+    const fileId = msg.photo[msg.photo.length - 1].file_id;
+    const file = await bot.getFile(fileId);
+    const fileUrl = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
+
+    const { nama, status, asal_sekolah, unit_magang, kehadiran } = state.data;
+
+    await saveToGoogleSheet({
+      nama,
+      status,
+      asal_sekolah,
+      unit_magang,
+      kehadiran,
+      fileUrl
+    });
+
+    await bot.sendMessage(chatId, `✅ Absensi berhasil!`);
+
+    await bot.sendPhoto(-4609772485, fileId, {
+      caption: `📢 ABSENSI BARU\n\n▸ Nama: ${nama}\n▸ Status: ${status}\n▸ Asal: ${asal_sekolah}\n▸ Unit: ${unit_magang}\n▸ Kehadiran: ${kehadiran}\n▸ Waktu: ${new Date().toLocaleString()}`
+    });
+
+    await sendAttendanceImages(-4609772485);
+
+    delete userState[chatId];
+
+  } catch (error) {
+    console.error(`[ERROR] ${error}`);
+    bot.sendMessage(chatId, "❌ Terjadi kesalahan saat memproses foto.");
+  }
+});
+
+bot.on("polling_error", (error) => {
+  console.error("Polling error:", error);
+  setTimeout(() => bot.startPolling(), 5000);
+});

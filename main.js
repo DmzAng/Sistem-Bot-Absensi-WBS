@@ -1,0 +1,557 @@
+require("dotenv").config();
+const { createBot, getEntityByType, createKeyboard, isOfficeHours } = require('./src/utils/telegramBot');
+const { initSchedulers } = require('./src/utils/scheduler');
+const { saveAttendance, saveRegistration, getStudentByUsername, getTodayAttendanceByUsername } = require('./src/utils/googleSheets');
+const { downloadPDF, convertPDFToImages, ensureDirectories } = require('./src/utils/pdfUtils');
+const fetch = require('node-fetch');
+const fs = require('fs');
+const path = require('path');
+const { log } = require("console");
+const exifParser = require('exif-parser');
+
+const bot = createBot();
+const userStates = {};
+
+// Jadwalkan tugas harian
+initSchedulers(bot);
+
+bot.onText(/\/daftarmagang/, async (msg) => {
+  const chatId = msg.chat.id;
+  const username = msg.from.username;
+  
+  if (!username) {
+    return bot.sendMessage(chatId, "❌ Anda harus memiliki username Telegram untuk mendaftar");
+  }
+
+  try {
+    const existing = await getStudentByUsername(username);
+    if (existing) {
+      return bot.sendMessage(chatId, `❌ Username @${username} sudah terdaftar!`);
+    }
+
+    userStates[chatId] = {
+      registration: {
+        step: 1,
+        entityType: 'MAGANG',
+        data: {}
+      }
+    };
+    bot.sendMessage(chatId, "📝 Silakan masukkan Nama Lengkap Anda:");
+  } catch (error) {
+    console.error(error);
+    bot.sendMessage(chatId, "❌ Gagal memproses pendaftaran");
+  }
+});
+
+bot.onText(/\/daftarwbs/, async (msg) => {
+  const chatId = msg.chat.id;
+  const username = msg.from.username;
+  
+  if (!username) {
+    return bot.sendMessage(chatId, "❌ Anda harus memiliki username Telegram untuk mendaftar");
+  }
+
+  try {
+    const existing = await getStudentByUsername(username);
+    if (existing) {
+      return bot.sendMessage(chatId, `❌ Username @${username} sudah terdaftar!`);
+    }
+
+    userStates[chatId] = {
+      registration: {
+        step: 1,
+        entityType: 'WBS',
+        data: {}
+      }
+    };
+    bot.sendMessage(chatId, "📝 Silakan masukkan Nama Lengkap Anda:");
+  } catch (error) {
+    console.error(error);
+    bot.sendMessage(chatId, "❌ Gagal memproses pendaftaran");
+  }
+});
+
+// Hendle
+bot.onText(/\/absen/, async (msg) => {
+  const chatId = msg.chat.id;
+  const username = msg.from.username;
+  console.log(`[ABSEN] Memulai absen untuk @${username} di chat ${chatId}`);
+  
+  if (!username) {
+    return bot.sendMessage(chatId, "❌ Anda harus memiliki username Telegram untuk absen");
+  }
+
+  try {
+    console.log(`[ABSEN] Mencari data siswa untuk @${username}`);
+    const student = await getStudentByUsername(username);
+    
+    if (!student) {
+      console.log(`[ABSEN] Error: Belum terdaftar`);
+      return bot.sendMessage(chatId, "❌ Anda belum terdaftar. Silakan daftar dulu");
+    }
+    console.log(`[ABSEN] Memeriksa absen hari ini`);
+    const hasCheckedIn = await getTodayAttendanceByUsername(username, student.type);
+    if (hasCheckedIn) {
+      return bot.sendMessage(chatId, "❌ Anda sudah melakukan absen hari ini.");
+    }
+
+    const now = new Date();
+    const status = now.getHours() < 9 ? 'HADIR' : 'TERLAMBAT';
+    
+    userStates[chatId] = {
+      step: 1,
+      student: {
+        ...student,
+        username
+      },
+      entityType: student.type,
+      healthStatus: null,
+      keterangan: null,
+      status: null
+    };
+    
+    bot.sendMessage(chatId, "🩺 Pilih Status Kesehatan:", {
+      reply_markup: {
+        keyboard: [getEntityByType(student.type).healthOptions],
+        one_time_keyboard: true
+      }
+    });
+
+  } catch (error) {
+    console.error(`[ABSEN] Error:`, error);
+    bot.sendMessage(chatId, "❌ Gagal memproses absen");
+  }
+});
+
+// Handle Input Pendaftaran
+bot.on("message", async (msg) => {
+  const chatId = msg.chat.id;
+  if (!msg.text) return;
+  const text = msg.text;
+  const state = userStates[chatId]?.registration ? 
+  userStates[chatId].registration : 
+  userStates[chatId];
+  const user = msg.from.username || 'tidak_ada_username';
+
+  if (!state) return;
+
+  if (userStates[chatId]?.registration) {
+      // Proses Magang
+      if (state.entityType === 'MAGANG') {
+        switch(state.step) {
+          case 1:
+            state.data.nama = text;
+            state.step = 2;
+            bot.sendMessage(chatId, "📌 Pilih Status:", {
+              reply_markup: {
+                keyboard: [['PKL', 'Magang']],
+                one_time_keyboard: true
+              }
+            });
+            break;
+          
+          case 2:
+            if (!['PKL', 'Magang'].includes(text)) {
+              return bot.sendMessage(chatId, "❌ Pilihan tidak valid!");
+            }
+            state.data.status = text;
+            state.step = 3;
+            bot.sendMessage(chatId, "🏫 Masukkan Asal Sekolah/Universitas:");
+            break;
+          
+          case 3:
+            state.data.asal = text;
+            state.step = 4;
+            bot.sendMessage(chatId, "🏢 Pilih Unit Penempatan:", {
+              reply_markup: {
+                keyboard: [getEntityByType('MAGANG').unitOptions],
+                one_time_keyboard: true
+              }
+            });
+            break;
+          
+          case 4:
+            state.data.unit = text;
+            state.data.username = user;
+            await saveRegistration('Magang', [
+              state.data.nama,
+              state.data.status,
+              state.data.asal,
+              state.data.unit,
+              state.data.username
+            ]);
+            delete userStates[chatId];
+            console.log(`✅ Pendaftaran Magang atas nama ${state.data.nama} berhasil!`)
+            bot.sendMessage(chatId, "✅ Pendaftaran Magang berhasil!");
+            break;
+        }
+      }
+  
+      // Proses WBS
+      if (state.entityType === 'WBS') {
+        switch(state.step) {
+          case 1:
+            state.data.nama = text;
+            state.step = 2;
+            bot.sendMessage(chatId, "💼 Masukkan Posisi/Jabatan:");
+            break;
+          
+          case 2:
+            state.data.posisi = text;
+            state.data.unit = getEntityByType('WBS').unit;
+            state.data.username = user;
+            await saveRegistration('WBS', [
+              state.data.nama,
+              state.data.posisi,
+              state.data.unit,
+              state.data.username
+            ]);
+            delete userStates[chatId];
+            bot.sendMessage(chatId, "✅ Pendaftaran WBS berhasil!");
+            break;
+        }
+      }
+    return;
+  }
+
+
+  if (state?.step && !state.registration) {
+    console.log(`[PROSES] Step ${state.step} untuk chat ${chatId}`);
+    switch(state.step) {
+      case 1:
+        console.log(`[PROSES] Menerima status kesehatan: ${text}`);
+        if (!getEntityByType(state.entityType).healthOptions.includes(text)) {
+          return bot.sendMessage(chatId, "❌ Pilihan tidak valid!");
+        }
+        
+        state.healthStatus = text;
+        // state.step = 2;
+
+        if (text === 'Sehat') {
+          const now = new Date();
+          state.status = now.getHours() < 9 ? 'HADIR' : 'TERLAMBAT';
+          console.log(`[PROSES] Meminta foto untuk absen`);
+          bot.sendMessage(chatId, `📸 Silakan:
+1. Buka kamera Telegram
+2. Aktifkan GPS
+3. Ambil foto menggunakan kamera
+4. Kirim foto tersebut`, {
+            reply_markup: { 
+              force_reply: true,
+              remove_keyboard: true 
+            }
+          });
+        } else {
+          state.step = 2;
+          bot.sendMessage(chatId, "📝 Mohon tulis keterangan Anda:");        }
+        break;
+
+      case 2:
+        if (state.healthStatus !== 'Sehat') {
+          state.keterangan = text;
+
+          await saveAttendanceData(chatId, {
+            ...state,
+            location: { lat: null, lon: null },
+            photo: { fileUrl: '-' }
+          });
+          
+          delete userStates[chatId];
+        }
+        break;
+    }
+  }
+});
+
+bot.on("photo", async (msg) => {
+  const chatId = msg.chat.id;
+  const state = userStates[chatId];
+  console.log(`[FOTO] Menerima foto dari ${chatId}`, state ? "" : "State tidak ditemukan!");
+  
+  if (!state || state.step !== 1) return;
+
+  try {
+    const fileId = msg.photo[msg.photo.length - 1].file_id;
+    const file = await bot.getFile(fileId);
+    const fileUrl = `https://api.telegram.org/file/bot${process.env.TOKEN}/${file.file_path}`;
+    
+    // Simpan data foto ke state
+    state.photo = { fileId, fileUrl };
+    
+    // Ekstrak EXIF
+    const response = await fetch(fileUrl);
+    const buffer = await response.buffer();
+    const parser = exifParser.create(buffer);
+    const exifData = parser.parse().tags;
+
+    // Coba dapatkan lokasi dari EXIF
+    let finalLat, finalLon;
+    if (exifData.GPSLatitude && exifData.GPSLongitude) {
+      const latRef = exifData.GPSLatitudeRef || 'N';
+      const lonRef = exifData.GPSLongitudeRef || 'E';
+      
+      finalLat = exifData.GPSLatitude[0] + 
+                exifData.GPSLatitude[1]/60 + 
+                exifData.GPSLatitude[2]/3600;
+      finalLat = latRef === 'S' ? -finalLat : finalLat;
+      
+      finalLon = exifData.GPSLongitude[0] + 
+                exifData.GPSLongitude[1]/60 + 
+                exifData.GPSLongitude[2]/3600;
+      finalLon = lonRef === 'W' ? -finalLon : finalLon;
+
+      state.location = {
+        lat: finalLat,
+        lon: finalLon
+      };
+    }
+
+    // Jika ada lokasi langsung simpan
+    if (finalLat && finalLon) {
+      console.log(`[FOTO] Koordinat ditemukan: ${finalLat}, ${finalLon}`);
+      state.location = { lat: finalLat, lon: finalLon };
+      return await saveAttendanceData(chatId, state);
+    }
+    
+    // Jika tidak ada lokasi, minta lokasi manual
+    console.log(`[FOTO] Tidak ada koordinat, meminta lokasi manual`);
+    bot.sendMessage(chatId, "📍 Silakan bagikan lokasi Anda:", {
+      reply_markup: {
+        keyboard: [[{ text: "📌 Bagikan Lokasi", request_location: true }]],
+        one_time_keyboard: true
+      }
+    });
+
+  } catch (error) {
+    console.error(error);
+    bot.sendMessage(chatId, "❌ Gagal memproses foto");
+  }
+});
+
+bot.on("location", async (msg) => {
+  const chatId = msg.chat.id;
+  const state = userStates[chatId];
+  console.log(`[LOKASI] Menerima lokasi dari ${chatId}`, state ? "" : "State tidak ditemukan!");
+  
+  if (!state || state.step !== 1) {
+    console.log(`[LOKASI] State invalid`);
+    return bot.sendMessage(chatId, "❌ Sesi tidak valid. Mulai absen lagi dari awal");
+  }
+
+  try {
+    console.log(`[LOKASI] Memproses lokasi...`);
+    state.location = {
+      lat: msg.location.latitude,
+      lon: msg.location.longitude
+    };
+    console.log(`[LOKASI] Koordinat: ${state.location.lat}, ${state.location.lon}`);
+    
+    await saveAttendanceData(chatId, state);
+    
+  } catch (error) {
+    console.error(`[LOKASI] Error:`, error);
+    bot.sendMessage(chatId, "❌ Gagal memproses lokasi: " + error.message);
+  }
+});
+
+async function getLocationName(lat, lon) {
+  try {
+    const response = await fetch(
+      `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=18&addressdetails=1`
+    );
+    const data = await response.json();
+    
+    const addressComponents = [];
+    
+    if (data.address.road) addressComponents.push(data.address.road);
+    
+    const city = data.address.city || data.address.town || data.address.village;
+    if (city) addressComponents.push(city);
+    
+    if (data.address.state) addressComponents.push(data.address.state);
+    
+    if (data.address.postcode) addressComponents.push(data.address.postcode);
+    
+    if (data.address.country) addressComponents.push(data.address.country);
+    
+    return {
+      city: city || '-',
+      state: data.address.state || '-',
+      country: data.address.country || '-',
+      full_address: addressComponents.join(', ') || 'Lokasi tidak dikenal'
+    };
+  } catch (error) {
+    console.error('Error geocoding:', error);
+    return null;
+  }
+}
+
+async function saveAttendanceData(chatId, state) {
+  try {
+    // Validasi data penting
+    const isSehat = state.healthStatus === 'Sehat';
+
+    if (isSehat) {
+      if (!state.location || !state.photo) {
+        throw new Error('Data lokasi atau foto tidak lengkap');
+      }
+    }
+    
+    const lokasiData = isSehat ? 
+    await getLocationName(state.location?.lat, state.location?.lon) : 
+    { full_address: 'Tidak diperlukan' };
+    
+    const now = new Date();
+    const formattedDate = now.toLocaleDateString('en-GB', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric'
+    });
+    
+    const formattedTime = [
+      now.getHours().toString().padStart(2, '0'),
+      now.getMinutes().toString().padStart(2, '0'),
+      now.getSeconds().toString().padStart(2, '0')
+    ].join(':');
+
+    // Siapkan payload
+    const rowData = state.entityType === 'MAGANG' 
+      ? [
+        formattedDate,
+        state.student.nama,
+        state.student.status || '-',
+        state.student.asal || '-',
+        state.student.unit,
+        state.healthStatus,
+        isSehat ? (now.getHours() < 9 ? 'HADIR' : 'TERLAMBAT') : state.healthStatus,
+        formattedTime,
+        isSehat ? (state.photo?.fileUrl || '-') : '-',
+        `@${state.student.username}`,
+        isSehat ? (state.location?.lat?.toFixed(6) || '-') : '-',
+        isSehat ? (state.location?.lon?.toFixed(6) || '-') : '-',
+        lokasiData?.full_address || '-',
+        state.keterangan || '-'
+      ] 
+      : [
+        formattedDate,
+        state.student.nama,
+        state.student.posisi || '-',
+        state.student.unit,
+        isSehat ? (now.getHours() < 9 ? 'HADIR' : 'TERLAMBAT') : state.healthStatus,
+        state.healthStatus,
+        formattedTime,
+        isSehat ? (state.photo?.fileUrl || '-') : '-',
+        `@${state.student.username}`,
+        isSehat ? (state.location?.lat?.toFixed(6) || '-') : '-',
+        isSehat ? (state.location?.lon?.toFixed(6) || '-') : '-',
+        lokasiData?.full_address || '-',
+        state.keterangan || '-'
+      ];
+
+    // Simpan ke Google Sheets
+    await saveAttendance(
+      getEntityByType(state.entityType).rekapSheet,
+      rowData
+    );
+
+    if (isSehat) {
+      const caption = `📋 *LAPORAN ABSENSI* 📋
+\`\`\`yaml
+Tanggal: ${formattedDate}
+Waktu: ${formattedTime}
+Lokasi: ${lokasiData?.full_address || 'Tidak terdeteksi'}
+Status: ${rowData[6]}
+\`\`\``;
+
+      await bot.sendPhoto(
+        process.env.GROUP_CHAT_ID,
+        state.photo.fileId,
+        {
+          caption: caption,
+          parse_mode: 'MarkdownV2',
+          message_thread_id: process.env[`REKAP_${state.entityType.toUpperCase()}_TOPIC_ID`]
+        }
+      );
+    }
+  
+    // Konfirmasi ke user
+    if (isSehat) {
+      bot.sendMessage(chatId, `✅ Absensi berhasil!\nStatus: ${rowData[6]}\nLokasi: ${lokasiData?.full_address || 'Tidak terdeteksi'}`, {
+        reply_markup: { remove_keyboard: true }
+      });
+    } else {
+      bot.sendMessage(chatId, `✅ Izin/sakit berhasil dicatat: ${state.keterangan}`, {
+        reply_markup: { remove_keyboard: true }
+      });
+    }
+
+    // Bersihkan state
+    delete userStates[chatId];
+
+  } catch (error) {
+    console.error('Error saveAttendanceData:', error);
+    bot.sendMessage(chatId, `❌ Gagal menyimpan data absensi: ${error.message}`);
+    
+    // Reset state jika error
+    delete userStates[chatId];
+  }
+}
+
+bot.onText(/\/rekap(?:\s(\w+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const entityType = match[1] ? match[1].toUpperCase() : null;
+
+  // Validasi entity type
+  if (!entityType || !['MAGANG', 'WBS'].includes(entityType)) {
+    return bot.sendMessage(
+      chatId,
+      "⚠️ Format salah. Gunakan /rekap <jenis>\nContoh: /rekap magang\nJenis yang valid: magang, wbs"
+    );
+  }
+
+  try {
+    const response = await fetch(`${process.env.APPSCRIPT_URL}?sheet=${entityType.toLowerCase()}`);
+    
+    // Debugging response
+    const responseText = await response.text();
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    
+    try {
+      const data = JSON.parse(responseText);
+      if (!data.fileUrl) {
+        throw new Error(data.error || 'URL PDF tidak valid dari AppScript');
+      }
+
+      const pdfPath = await downloadPDF(data.fileUrl, `rekap_${entityType}_${Date.now()}.pdf`);
+      const imagePaths = await convertPDFToImages(pdfPath);
+
+      const topicId = process.env[`REKAP_${entityType}_TOPIC_ID`];
+      for (const imgPath of imagePaths) {
+        await bot.sendPhoto(process.env.GROUP_CHAT_ID, imgPath, { 
+          message_thread_id: topicId
+        });
+      }
+
+      fs.unlinkSync(pdfPath);
+      imagePaths.forEach(img => fs.unlinkSync(img));
+      
+    } catch (e) {
+      console.error('Invalid JSON response:', responseText);
+      throw new Error('Format response tidak valid dari server');
+    }
+    
+  } catch (error) {
+    console.error(error);
+    bot.sendMessage(chatId, `❌ Gagal membuat rekap: ${error.message}`);
+  }
+});
+
+bot.on("polling_error", (error) => {
+  console.error("Polling error:", error);
+  setTimeout(() => bot.startPolling(), 5000);
+});
+
+console.log("🚀 Bot berhasil berjalan!");
+
