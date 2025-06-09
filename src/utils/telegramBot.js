@@ -1,5 +1,6 @@
   const TelegramBot = require("node-telegram-bot-api");
   const { ensureDirectories } = require('./pdfUtils');
+  const axios = require('./axiosUtils');
 
   const ENTITIES = {
     MAGANG: {
@@ -23,6 +24,35 @@
       healthOptions: ['Sehat', 'Kurang Fit', 'Izin']
     }
   };
+
+  const createBot = () => {
+  const bot = new TelegramBot(process.env.TOKEN, {
+    polling: {
+      interval: 3000,
+      timeout: 10000,
+      autoStart: true,
+      params: {
+        timeout: 10
+      }
+    },
+    request: {
+      agentOptions: {
+        keepAlive: true,
+        maxSockets: 50
+      }
+    },
+    onlyFirstMatch: true
+  });
+
+  bot.on('error', (error) => {
+    console.error('Bot error:', error);
+    if (error.code === 'EFATAL') {
+      setTimeout(() => bot.startPolling(), 5000);
+    }
+  });
+
+  return bot;
+};
 
   module.exports = {
     getEntityByType(type) {
